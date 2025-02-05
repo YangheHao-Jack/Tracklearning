@@ -12,7 +12,7 @@ from torchvision.transforms import InterpolationMode
 
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 class ResizeAndToTensor:
     def __init__(self, size=(512, 512)):
         self.size = size  # (height, width)
@@ -197,13 +197,14 @@ def validate_one_epoch(model, loader, criterion, device, epoch_idx):
 
 def main():
     # Adjust these paths
-    images_dir = "G:/Trackinglearning/segmentation/phantom_train/images/"
-    masks_dir  = "G:/Trackinglearning/segmentation/phantom_train/masks/"
-
+    images_dir = "/home/yanghehao/tracklearning/segmentation/phantom_train/images/"
+    masks_dir  = "/home/yanghehao/tracklearning/segmentation/phantom_train/masks/"
+    
+    
     batch_size = 4
-    num_epochs = 2  # set small for debugging
+    num_epochs = 20 # set small for debugging
     learning_rate = 1e-4
-
+    
     # 1) Check GPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("[Main] Using device:", device)
@@ -218,6 +219,16 @@ def main():
     if len(all_images) == 0:
         print("[Error] No image files found. Check your path!")
         return
+    all_masks = sorted([
+        f for f in os.listdir(masks_dir)
+        if f.lower().endswith((".npy"))
+    ])
+    print(f"[Main] Found {len(all_masks)} mask files in {masks_dir}")
+
+    if len(all_masks) == 0:
+        print("[Error] No mask files found. Check your path!")
+        return
+
 
     # 3) Train-Val split
     train_files, val_files = train_test_split(all_images, test_size=0.2, random_state=42)
@@ -240,13 +251,23 @@ def main():
     model = UNet(in_channels=3, out_channels=2).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler_train = ReduceLROnPlateau(optimizer, mode='min', factor=0.5,
+                                        patience=2, verbose=True)
+    scheduler_val   = ReduceLROnPlateau(optimizer, mode='min', factor=0.5,
+                                        patience=3, verbose=True)
 
     # 6) Training
     print("[Main] Starting training...")
     for epoch in range(num_epochs):
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch)
         val_loss   = validate_one_epoch(model, val_loader, criterion, device, epoch)
-        print(f"[Epoch {epoch+1}/{num_epochs}] Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}\n")
+        scheduler_train.step(train_loss)  # if train loss doesn't improve, reduce LR
+        scheduler_val.step(val_loss)      # if val loss doesn't improve, reduce LR
+
+        current_lr = optimizer.param_groups[0]["lr"]
+        
+        print(f"Epoch [{epoch+1}/{num_epochs}] | LR: {current_lr:.6f} | "
+              f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
 
     # 7) Save model
     torch.save(model.state_dict(), "catheter_seg_model_gpu_debug.pth")

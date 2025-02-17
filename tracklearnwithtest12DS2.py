@@ -1,11 +1,14 @@
 import os
 import random
+import itertools
 import numpy as np
 import cv2
+import timm
 import matplotlib.pyplot as plt
 from PIL import Image
 from tqdm import tqdm
 from scipy.ndimage import distance_transform_edt
+from skimage.morphology import skeletonize
 
 import torch
 import torch.nn as nn
@@ -40,7 +43,9 @@ set_seed(42)
 # ------------------------------
 
 class DiceLoss(nn.Module):
-    """Standard Dice Loss for binary segmentation."""
+    """
+    Standard Dice Loss for binary segmentation.
+    """
     def __init__(self, smooth=1e-6):
         super(DiceLoss, self).__init__()
         self.smooth = smooth
@@ -57,11 +62,15 @@ class DiceLoss(nn.Module):
 def compute_SDM(mask_np):
     dt_out = distance_transform_edt(1 - mask_np)
     dt_in = distance_transform_edt(mask_np)
-    return dt_out - dt_in
+    sdm = dt_out - dt_in
+    return sdm
 
 def compute_SDM_batch(mask_tensor):
     mask_np = mask_tensor.cpu().numpy()
-    sdm_list = [compute_SDM(mask_np[i, 0]) for i in range(mask_np.shape[0])]
+    sdm_list = []
+    for i in range(mask_np.shape[0]):
+        sdm = compute_SDM(mask_np[i, 0])
+        sdm_list.append(sdm)
     sdm_np = np.stack(sdm_list, axis=0)
     sdm_tensor = torch.tensor(sdm_np, dtype=torch.float32, device=mask_tensor.device).unsqueeze(1)
     return sdm_tensor
@@ -72,13 +81,13 @@ class ViTFeatureExtractor(nn.Module):
     """
     def __init__(self):
         super(ViTFeatureExtractor, self).__init__()
-        import timm  # Import timm locally if needed
         self.vit = timm.create_model('vit_base_patch16_384', pretrained=True)
         self.vit.reset_classifier(0)
     def forward(self, x):
         if x.shape[1] == 1:
             x = x.repeat(1, 3, 1, 1)
-        return self.vit(x)
+        features = self.vit(x)
+        return features
 
 class ShapeSensitiveLoss(nn.Module):
     """
@@ -104,7 +113,8 @@ class ShapeSensitiveLoss(nn.Module):
         features_pred = self.vit_extractor(pred_SDM_resized)
         features_true = self.vit_extractor(true_SDM_resized)
         cos_sim = F.cosine_similarity(features_pred, features_true, dim=1)
-        return 1 - cos_sim.mean()
+        loss = 1 - cos_sim.mean()
+        return loss
 
 class CombinedLoss(nn.Module):
     """
@@ -122,91 +132,22 @@ class CombinedLoss(nn.Module):
         loss_shape = self.shape_loss(logits, true)
         return self.dice_weight * loss_dice + self.shape_weight * loss_shape
 
+def entropy_loss_fn(logits):
+    """
+    Unsupervised entropy loss for domain adaptation.
+    Encourages confident predictions.
+    """
+    probs = F.softmax(logits, dim=1)
+    entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
+    return entropy.mean()
+
 # ------------------------------
 # 2. Dataset and Transforms (for images and masks)
 # ------------------------------
 
-class EnhanceContrastIntensityBlur(A.ImageOnlyTransform):
-    def __init__(self, clipLimit=2.0, tileGridSize=(8, 8), blur_kernel=(5, 5),
-                 intensity_filter_fn=None, always_apply=False, p=1.0):
-        """
-        Enhances contrast using CLAHE, optionally applies an intensity filter, and then blurs the image.
-        Returns a dictionary with:
-            - 'enhanced': the image after CLAHE.
-            - 'intensity_filtered': the image after intensity filtering.
-            - 'blurred': the final blurred image.
-        In the pipeline, we update the "image" key to the blurred image.
-        
-        Args:
-            clipLimit (float): CLAHE clip limit.
-            tileGridSize (tuple): CLAHE grid size.
-            blur_kernel (tuple): Kernel size for Gaussian blur.
-            intensity_filter_fn (callable, optional): Function that accepts an image (numpy array)
-                and returns a processed image. If None, intensity filtering is skipped.
-            always_apply (bool): Whether to always apply the transform.
-            p (float): Probability of applying the transform.
-        """
-        super(EnhanceContrastIntensityBlur, self).__init__(always_apply, p)
-        self.clipLimit = clipLimit
-        self.tileGridSize = tileGridSize
-        self.blur_kernel = blur_kernel
-        self.intensity_filter_fn = intensity_filter_fn
-
-    def __call__(self, image, **kwargs):
-        # Ensure the image is in uint8 format (required by OpenCV CLAHE)
-        image = np.array(image, dtype=np.uint8)
-        
-        # Step 1: Contrast enhancement using CLAHE.
-        clahe = cv2.createCLAHE(clipLimit=self.clipLimit, tileGridSize=self.tileGridSize)
-        enhanced = clahe.apply(image)
-        
-        # Step 2: Optional intensity filtering.
-        if self.intensity_filter_fn is not None:
-            intensity_filtered = self.intensity_filter_fn(enhanced)
-        else:
-            intensity_filtered = enhanced.copy()
-        
-        # Step 3: Apply Gaussian blur.
-        blurred = cv2.GaussianBlur(intensity_filtered, self.blur_kernel, 0)
-        
-        # Build the output dictionary.
-        results = {
-            'image': blurred,  # This will update the "image" key.
-            'enhanced': enhanced,
-            'intensity_filtered': intensity_filtered,
-            'blurred': blurred
-        }
-        # If a mask was passed, pass it along unchanged.
-        if "mask" in kwargs:
-            results["mask"] = kwargs["mask"]
-            
-        return results
-
-    def get_transform_init_args_names(self):
-        return ("clipLimit", "tileGridSize", "blur_kernel", "intensity_filter_fn")
-
-# --- Optional Intensity Filter Function ---
-
-def intensity_clip_filter(image, min_value=50, max_value=200):
-    """
-    Clips intensity values of the image between min_value and max_value.
-    
-    Args:
-        image (np.ndarray): Input image.
-        min_value (int): Minimum intensity.
-        max_value (int): Maximum intensity.
-    
-    Returns:
-        np.ndarray: The intensity-clipped image.
-    """
-    return np.clip(image, min_value, max_value)
-
-# --- Augmentation Pipeline Definition ---
-
 def get_augmentation_pipeline(size=(512, 512), augment=True):
     if augment:
         return A.Compose([
-            # Keep your previous transforms.
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
             A.RandomRotate90(p=0.5),
@@ -216,19 +157,7 @@ def get_augmentation_pipeline(size=(512, 512), augment=True):
             A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
             A.GaussNoise(p=0.3),
             A.Blur(blur_limit=3, p=0.2),
-            A.CoarseDropout(max_holes=1,
-                            max_height=int(size[1]*0.1),
-                            max_width=int(size[0]*0.1),
-                            p=0.2),
-            # Insert the custom transform.
-            EnhanceContrastIntensityBlur(
-                clipLimit=2.0,
-                tileGridSize=(8,8),
-                blur_kernel=(5,5),
-                intensity_filter_fn=lambda img: intensity_clip_filter(img, 50, 200),
-                p=1.0  # Always apply (adjust as needed)
-            ),
-            # Continue with downstream transforms.
+            A.CoarseDropout(max_holes=1, max_height=int(size[1] * 0.1), max_width=int(size[0] * 0.1), p=0.2),
             A.Resize(width=size[0], height=size[1]),
             A.Normalize(mean=(0.485,), std=(0.229,)),
             ToTensorV2()
@@ -240,22 +169,15 @@ def get_augmentation_pipeline(size=(512, 512), augment=True):
             ToTensorV2()
         ])
 
-# --- Dataset Transform Class ---
-
 class ResizeAndToTensorAlbumentations:
     def __init__(self, size=(512, 512), augment=False):
-        self.size = size
         self.transform = get_augmentation_pipeline(size=size, augment=augment)
-
     def __call__(self, image, mask):
         image_np = np.array(image)
         mask_np = np.array(mask)
-        # Ensure binary mask: map all values >1 to 1.
         mask_np = np.where(mask_np > 1, 1, mask_np).astype(np.uint8)
-        # Apply the augmentation. The custom transform will pass the mask along.
         augmented = self.transform(image=image_np, mask=mask_np)
         return augmented['image'], augmented['mask'].long()
-
 
 class BinarySegDatasetAlbumentations(Dataset):
     def __init__(self, images_dir, masks_dir, file_list, transform=None):
@@ -295,31 +217,87 @@ class BinarySegDatasetAlbumentations(Dataset):
         return image, mask
 
 # ------------------------------
-# 3. Advanced Model Definition: TransUNet with Flexible ResNet Encoder
+# 3. Video Frame Dataset for Domain Adaptation (Unlabeled Data)
+# ------------------------------
+
+class VideoFrameDataset(Dataset):
+    """
+    Extracts frames from a video file for unsupervised domain adaptation.
+    Loads all frames into memory.
+    """
+    def __init__(self, video_path, transform=None, every_n_frame=1):
+        self.transform = transform
+        self.frames = []
+        cap = cv2.VideoCapture(video_path)
+        count = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if count % every_n_frame == 0:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                self.frames.append(Image.fromarray(frame))
+            count += 1
+        cap.release()
+        print(f"[VideoFrameDataset] Loaded {len(self.frames)} frames from {video_path}")
+    def __len__(self):
+        return len(self.frames)
+    def __getitem__(self, idx):
+        image = self.frames[idx]
+        if self.transform is not None:
+            image = self.transform(image)['image']  # image-only transform
+        return image
+
+class ResizeAndToTensorAlbumentationsImageOnly:
+    def __init__(self, size=(512, 512), augment=False):
+        self.transform = A.Compose([
+            A.Resize(width=size[0], height=size[1]),
+            A.Normalize(mean=(0.485,), std=(0.229,)),
+            ToTensorV2()
+        ])
+    def __call__(self, image):
+        image_np = np.array(image)
+        augmented = self.transform(image=image_np)
+        return augmented
+
+# ------------------------------
+# 4. Advanced Model Definition: TransUNet with Flexible ResNet Encoder
 # ------------------------------
 
 class PositionalEncoding2D(nn.Module):
     def __init__(self, embed_dim, height, width):
+        """
+        Args:
+            embed_dim (int): Must be even.
+            height (int): Expected height of the feature map (e.g. img_size // 32).
+            width (int): Expected width of the feature map (e.g. img_size // 32).
+        """
         super(PositionalEncoding2D, self).__init__()
-        assert embed_dim % 2 == 0, "Embed dimension must be even"
-        # Initialize row and column embeddings with shape:
-        # row_embed: (1, embed_dim//2, height)
-        # col_embed: (1, embed_dim//2, width)
-        self.row_embed = nn.Parameter(torch.randn(1, embed_dim // 2, height))
-        self.col_embed = nn.Parameter(torch.randn(1, embed_dim // 2, width))
+        assert embed_dim % 2 == 0, "embed_dim must be even"
+        # Create row and column embeddings as 4D parameters
+        # row_embed: shape (1, embed_dim//2, height, 1)
+        # col_embed: shape (1, embed_dim//2, 1, width)
+        self.row_embed = nn.Parameter(torch.randn(1, embed_dim // 2, height, 1))
+        self.col_embed = nn.Parameter(torch.randn(1, embed_dim // 2, 1, width))
 
     def forward(self, x):
-        # x is expected to have shape (B, embed_dim, H, W)
+        """
+        Args:
+            x (torch.Tensor): Input feature map of shape (B, embed_dim, H, W).
+        Returns:
+            pos (torch.Tensor): Positional encoding of shape (B, embed_dim, H, W).
+        """
         B, C, H, W = x.shape
-        # Expand col_embed to shape (1, embed_dim//2, H, W)
-        col_embed = self.col_embed.unsqueeze(2).expand(-1, -1, H, -1)
-        # Expand row_embed to shape (1, embed_dim//2, H, W)
-        row_embed = self.row_embed.unsqueeze(3).expand(-1, -1, -1, W)
-        # Concatenate along the channel dimension to get (1, embed_dim, H, W)
-        pos = torch.cat([col_embed, row_embed], dim=1)
-        # Repeat for each batch
-        return pos.repeat(B, 1, 1, 1)
-
+        # Interpolate embeddings to match the current spatial size if needed.
+        # This handles cases when the actual feature map size (H, W) differs from (height, width)
+        row = F.interpolate(self.row_embed, size=(H, 1), mode='bilinear', align_corners=False)
+        col = F.interpolate(self.col_embed, size=(1, W), mode='bilinear', align_corners=False)
+        # Expand along the missing spatial dimension
+        row = row.expand(B, -1, H, W)
+        col = col.expand(B, -1, H, W)
+        # Concatenate along the channel dimension
+        pos = torch.cat([row, col], dim=1)  # shape: (B, embed_dim, H, W)
+        return pos
 
 class TransformerEncoder(nn.Module):
     def __init__(self, embed_dim, num_layers=4, num_heads=8, ff_dim=2048, dropout=0.1):
@@ -328,157 +306,128 @@ class TransformerEncoder(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
     def forward(self, x):
         # x: (S, B, embed_dim)
-        return self.transformer(x)
-
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(DoubleConv, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-    def forward(self, x):
-        return self.conv(x)
+        x = self.transformer(x)
+        return x
 
 class TransUNet(nn.Module):
     def __init__(self, num_classes=2, img_size=512, encoder_name='resnet34', pretrained=True):
         super(TransUNet, self).__init__()
         self.img_size = img_size
 
-        # Define channel mappings for supported ResNet backbones.
-        # Each entry is a tuple: (skip0, skip1, skip2, skip3, deepest)
-        # skip0: output of conv1 (always 64 for torchvision ResNets)
-        # skip1: output of layer1, skip2: layer2, skip3: layer3, deepest: layer4
-        channel_dict = {
-            'resnet18':  (64, 64, 128, 256, 512),
-            'resnet34':  (64, 64, 128, 256, 512),
-            'resnet50':  (64, 256, 512, 1024, 2048),
-            'resnet101': (64, 256, 512, 1024, 2048)
-        }
-        if encoder_name not in channel_dict:
-            raise ValueError("Unsupported encoder. Choose from 'resnet18', 'resnet34', 'resnet50', or 'resnet101'.")
-        self.skip0, self.skip1, self.skip2, self.skip3, self.deepest = channel_dict[encoder_name]
-
-        # Encoder: load the selected ResNet backbone.
+        # Encoder: Choose different ResNet backbones.
         encoder_fn = getattr(models, encoder_name)
         self.encoder = encoder_fn(pretrained=pretrained)
-        # Modify first conv layer to accept single-channel input.
+        # Adjust first convolutional layer if input is single-channel.
         self.encoder.conv1 = nn.Conv2d(1, self.encoder.conv1.out_channels,
                                        kernel_size=self.encoder.conv1.kernel_size,
                                        stride=self.encoder.conv1.stride,
                                        padding=self.encoder.conv1.padding,
                                        bias=False)
+        # If pretrained, average weights over RGB channels.
         if pretrained:
             with torch.no_grad():
-                # Average the weights over the RGB channels.
-                self.encoder.conv1.weight = nn.Parameter(
-                    self.encoder.conv1.weight.mean(dim=1, keepdim=True)
-                )
-        # Use layers up to layer4.
+                self.encoder.conv1.weight = nn.Parameter(self.encoder.conv1.weight.mean(dim=1, keepdim=True))
+        
+        # Use layers up to layer4 for feature extraction.
         self.encoder_layers = nn.Sequential(
-            self.encoder.conv1,     # output: skip0 channels (64)
+            self.encoder.conv1,    # (B,64,H/2,W/2)
             self.encoder.bn1,
             self.encoder.relu,
-            self.encoder.maxpool,   # still 64 channels
-            self.encoder.layer1,    # output: skip1 channels (64 or 256)
-            self.encoder.layer2,    # output: skip2 channels (128 or 512)
-            self.encoder.layer3,    # output: skip3 channels (256 or 1024)
-            self.encoder.layer4     # output: deepest channels (512 or 2048)
+            self.encoder.maxpool,  # (B,64,H/4,W/4)
+            self.encoder.layer1,   # (B,64,H/4,W/4)
+            self.encoder.layer2,   # (B,128,H/8,W/8)
+            self.encoder.layer3,   # (B,256,H/16,W/16)
+            self.encoder.layer4    # (B,512,H/32,W/32) or different depending on backbone.
         )
         
-        # Transformer branch.
-        # Flatten conv: from deepest channels to transformer embedding dimension.
-        self.transformer_embed_dim = 768  # fixed embedding dimension
+        # Transformer Encoder on the deepest feature map.
+        self.transformer_embed_dim = 512  # Adjust if using a backbone with different final channels.
         self.feat_h = img_size // 32
         self.feat_w = img_size // 32
-        self.flatten_conv = nn.Conv2d(self.deepest, self.transformer_embed_dim, kernel_size=1)
-        
-        # Positional encoding and transformer encoder.
-        self.pos_encoding = PositionalEncoding2D(self.transformer_embed_dim, self.feat_h, self.feat_w)
-        self.transformer_encoder = TransformerEncoder(embed_dim=self.transformer_embed_dim, 
-                                                      num_layers=24, num_heads=24, ff_dim=3096)
-        
-        # Decoder: We design the decoder differently for smaller vs. larger backbones.
-        # For resnet18/34:
-        #   skip1:  skip from layer1 = 64, skip2 = 128, skip3 = 256.
-        # For resnet50/101:
-        #   skip1:  skip from layer1 = 256, skip2 = 512, skip3 = 1024.
-        if encoder_name in ['resnet50', 'resnet101']:
-            up4_out = 1024
-            conv4_out = 512
-            up3_out = 512
-            conv3_out = 256
-            up2_out = 256
-            conv2_out = 128
-            up1_out = 128
-            conv1_out = 64
-        else:
-            up4_out = 256
-            conv4_out = 256
-            up3_out = 128
-            conv3_out = 128
-            up2_out = 64
-            conv2_out = 64
-            up1_out = 64
-            conv1_out = 64
+        self.num_patches = self.feat_h * self.feat_w
 
-        self.up4 = nn.ConvTranspose2d(self.transformer_embed_dim, up4_out, kernel_size=2, stride=2)
-        # For the first decoder block, we concatenate with skip from layer3.
-        self.conv4 = DoubleConv(up4_out + self.skip3, conv4_out)
-        self.up3 = nn.ConvTranspose2d(conv4_out, up3_out, kernel_size=2, stride=2)
-        self.conv3 = DoubleConv(up3_out + self.skip2, conv3_out)
-        self.up2 = nn.ConvTranspose2d(conv3_out, up2_out, kernel_size=2, stride=2)
-        self.conv2 = DoubleConv(up2_out + self.skip1, conv2_out)
-        self.up1 = nn.ConvTranspose2d(conv2_out, up1_out, kernel_size=2, stride=2)
-        # Here, we also concatenate the early features (skip0).
-        self.conv1 = DoubleConv(up1_out + self.skip0, conv1_out)
-        self.out_conv = nn.Conv2d(conv1_out, num_classes, kernel_size=1)
+        self.flatten_conv = nn.Conv2d(512, self.transformer_embed_dim, kernel_size=1)
+        self.pos_encoding = PositionalEncoding2D(self.transformer_embed_dim, self.feat_h, self.feat_w)
+        self.transformer_encoder = TransformerEncoder(embed_dim=self.transformer_embed_dim, num_layers=4, num_heads=8, ff_dim=2048)
+
+        # Decoder: U-Net style upsampling with skip connections.
+        # Use skip connections from encoder.layer3, encoder.layer2, and encoder.layer1.
+        self.up4 = nn.ConvTranspose2d(self.transformer_embed_dim, 256, kernel_size=2, stride=2)
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(256 + 256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True)
+        )
+        self.up3 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(128 + 128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True)
+        )
+        self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(64 + 64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        self.up1 = nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2)
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        self.out_conv = nn.Conv2d(64, num_classes, kernel_size=1)
 
     def forward(self, x):
+        # x: (B,1,H,W) assumed grayscale.
         # Encoder forward pass.
-        # We manually store skip features at the appropriate points.
-        # x0: after conv1 (skip0)
-        x0 = self.encoder.conv1(x)
-        x0 = self.encoder.bn1(x0)
-        x0 = self.encoder.relu(x0)
-        # After maxpool (still skip0 shape) but we don't use this.
-        x = self.encoder.maxpool(x0)
-        # x1: output of layer1 (skip1)
-        x1 = self.encoder.layer1(x)
-        # x2: output of layer2 (skip2)
-        x2 = self.encoder.layer2(x1)
-        # x3: output of layer3 (skip3)
-        x3 = self.encoder.layer3(x2)
-        # x4: output of layer4 (deepest)
-        x4 = self.encoder.layer4(x3)
+        x1 = self.encoder.conv1(x)       # (B,64,H/2,W/2)
+        x1 = self.encoder.bn1(x1)
+        x1 = self.encoder.relu(x1)
+        x2 = self.encoder.maxpool(x1)      # (B,64,H/4,W/4)
+        x3 = self.encoder.layer1(x2)       # (B,64,H/4,W/4)
+        x4 = self.encoder.layer2(x3)       # (B,128,H/8,W/8)
+        x5 = self.encoder.layer3(x4)       # (B,256,H/16,W/16)
+        x6 = self.encoder.layer4(x5)       # (B,512,H/32,W/32)
 
         # Transformer branch.
-        feat = self.flatten_conv(x4)           # (B, transformer_embed_dim, H/32, W/32)
-        pos = self.pos_encoding(feat)           # Same shape as feat.
+        feat = self.flatten_conv(x6)       # (B,512,H/32,W/32)
+        pos = self.pos_encoding(feat)        # (B,512,H/32,W/32)
         feat = feat + pos
         B, C, H, W = feat.shape
-        feat_flat = feat.view(B, C, -1).permute(2, 0, 1)  # (S, B, C) where S = H*W
+        feat_flat = feat.view(B, C, -1).permute(2, 0, 1)  # (S, B, C) with S = H*W
         feat_trans = self.transformer_encoder(feat_flat)
-        feat_trans = feat_trans.permute(0, 2, 1).reshape(B, C, H, W) # Note: or permute(1,2,0) depending on transformer output.
-        # Decoder:
-        d4 = self.up4(feat_trans)              # (B, up4_out, H/16, W/16)
-        d4 = torch.cat([d4, x3], dim=1)          # x3 has self.skip3 channels.
-        d4 = self.conv4(d4)                    # (B, conv4_out, H/16, W/16)
-        d3 = self.up3(d4)                      # (B, up3_out, H/8, W/8)
-        d3 = torch.cat([d3, x2], dim=1)          # x2 has self.skip2 channels.
-        d3 = self.conv3(d3)                    # (B, conv3_out, H/8, W/8)
-        d2 = self.up2(d3)                      # (B, up2_out, H/4, W/4)
-        d2 = torch.cat([d2, x1], dim=1)          # x1 has self.skip1 channels.
-        d2 = self.conv2(d2)                    # (B, conv2_out, H/4, W/4)
-        d1 = self.up1(d2)                      # (B, up1_out, H/2, W/2)
-        d1 = torch.cat([d1, x0], dim=1)          # x0 has self.skip0 channels.
-        d1 = self.conv1(d1)                    # (B, conv1_out, H/2, W/2)
-        out = self.out_conv(d1)                # (B, num_classes, H/2, W/2)
-        out = F.interpolate(out, scale_factor=2, mode='bilinear', align_corners=True)  # (B, num_classes, H, W)
+        feat_trans = feat_trans.permute(1, 2, 0).view(B, C, H, W)
+
+        # Decoder with skip connections.
+        d4 = self.up4(feat_trans)      # (B,256,H/16,W/16)
+        # Skip connection from x5: (B,256,H/16,W/16)
+        d4 = torch.cat([d4, x5], dim=1)
+        d4 = self.conv4(d4)
+
+        d3 = self.up3(d4)              # (B,128,H/8,W/8)
+        # Skip connection from x4: (B,128,H/8,W/8)
+        d3 = torch.cat([d3, x4], dim=1)
+        d3 = self.conv3(d3)
+
+        d2 = self.up2(d3)              # (B,64,H/4,W/4)
+        # Skip connection from x3: (B,64,H/4,W/4)
+        d2 = torch.cat([d2, x3], dim=1)
+        d2 = self.conv2(d2)
+
+        d1 = self.up1(d2)              # (B,64,H/2,W/2)
+        d1 = self.conv1(d1)
+        out = self.out_conv(d1)
+        out = F.interpolate(out, scale_factor=2, mode='bilinear', align_corners=True)
         return out
 
 # ------------------------------
@@ -513,20 +462,27 @@ class EarlyStopping:
                 print(f"[EarlyStopping] Validation loss improved to: {self.best_loss:.4f}")
 
 # ------------------------------
-# 6. Training, Validation, and Testing Functions (without Domain Adaptation)
+# 6. Training, Validation, and Testing Functions (with Mixed Precision and Domain Adaptation)
 # ------------------------------
 
-def train_one_epoch(model, loader, optimizer, criterion, device, epoch_idx, scaler):
+def train_one_epoch(model, loader, video_loader, optimizer, criterion, device, epoch_idx, scaler, unsup_weight=0.1):
     model.train()
     total_loss = 0.0
     print(f"--- [Train] Epoch {epoch_idx+1} ---")
+    video_iter = itertools.cycle(video_loader)
     for batch_idx, (images, masks) in enumerate(tqdm(loader, desc="Training", leave=False)):
         images = images.to(device)
         masks = masks.to(device)
         optimizer.zero_grad()
         with torch.amp.autocast('cuda'):
             outputs = model(images)
-            loss = criterion(outputs, masks)
+            loss_sup = criterion(outputs, masks)
+            # Unsupervised entropy loss on video frames.
+            video_images = next(video_iter).to(device)
+            video_outputs = model(video_images)
+            video_probs = F.softmax(video_outputs, dim=1)
+            unsup_loss = -torch.mean(torch.sum(video_probs * torch.log(video_probs + 1e-8), dim=1))
+            loss = loss_sup + unsup_weight * unsup_loss
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -628,9 +584,9 @@ def visualize_predictions(model, dataset, device, num_samples=3, post_process_fl
         image_np = image_np * 0.229 + 0.485
         image_np = np.clip(image_np * 255, 0, 255).astype(np.uint8)
         if image_np.ndim == 2:
-            image_np = np.stack([image_np] * 3, axis=-1)
+            image_np = np.stack([image_np]*3, axis=-1)
         elif image_np.shape[2] == 1:
-            image_np = np.concatenate([image_np] * 3, axis=-1)
+            image_np = np.concatenate([image_np]*3, axis=-1)
         overlay_image = image_np.copy()
         binary_mask = (pred == 1).astype(np.uint8)
         color = np.array([0, 255, 0], dtype=np.uint8)
@@ -659,28 +615,30 @@ def visualize_predictions(model, dataset, device, num_samples=3, post_process_fl
         plt.show()
 
 # ------------------------------
-# 8. Main Function: Setup, Training, and Testing (Without Domain Adaptation)
+# 8. Main Function: Setup, Training, and Testing
 # ------------------------------
 
 def main():
     # Update these paths accordingly.
     images_dir = "/home/yanghehao/tracklearning/segmentation/phantom_train/images/"
     masks_dir = "/home/yanghehao/tracklearning/segmentation/phantom_train/masks/"
-    test_images_dir = "/home/yanghehao/tracklearning/segmentation/phantom_test/images"
-    test_masks_dir = "/home/yanghehao/tracklearning/segmentation/phantom_test/masks"
+    test_images_dir = "/home/yanghehao/tracklearning/segmentation/phantom_test/images/"
+    test_masks_dir = "/home/yanghehao/tracklearning/segmentation/phantom_test/masks/"
+    video_path = "/home/yanghehao/tracklearning/DATA/Tom.mp4"  # Video for domain adaptation
 
     batch_size = 16
-    num_epochs = 100
+    num_epochs = 150
     learning_rate = 1e-4
-    save_path = "best_transunet_modelImproveARG2.pth"
+    save_path = "best_transunet_modelDS.pth"
     patience = 10
+    unsup_weight = 0.1  # Weight for unsupervised (entropy) loss on video frames
     post_process_flag = False
     apply_erosion = True
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Main] Using device: {device}")
 
-    # Labeled training data.
+    # Labeled source domain.
     all_train_images = sorted([f for f in os.listdir(images_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))])
     print(f"[Main] Found {len(all_train_images)} training images in {images_dir}")
     if len(all_train_images) == 0:
@@ -693,7 +651,7 @@ def main():
         print("[Error] No training masks found or mismatched filenames.")
         return
 
-    # Labeled test data.
+    # Test domain.
     all_test_images = sorted([f for f in os.listdir(test_images_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))])
     print(f"[Main] Found {len(all_test_images)} test images in {test_images_dir}")
     if len(all_test_images) == 0:
@@ -720,15 +678,20 @@ def main():
     val_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    print("[Main] Starting training with advanced model: TransUNet (Without Domain Adaptation)")
+    # Unlabeled target domain: video frames for domain adaptation.
+    video_transform = ResizeAndToTensorAlbumentationsImageOnly(size=(512, 512), augment=False)
+    video_dataset = VideoFrameDataset(video_path, transform=video_transform, every_n_frame=5)
+    video_loader = DataLoader(video_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+
+    print("[Main] Starting training with advanced model: TransUNet")
 
     # Initialize the TransUNet model with flexible ResNet encoder.
-    # Change encoder_name to 'resnet18', 'resnet34', 'resnet50', etc. as desired.
-    model = TransUNet(num_classes=2, img_size=512, encoder_name='resnet50', pretrained=True).to(device)
+    # You can change 'encoder_name' to 'resnet18', 'resnet34', 'resnet50', etc.
+    model = TransUNet(num_classes=2, img_size=512, encoder_name='resnet34', pretrained=True).to(device)
     # Use the combined loss (Dice + Shape-Sensitive).
     criterion = CombinedLoss(dice_weight=0.5, shape_weight=0.5, smooth=1e-6)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-6)
+    scheduler = CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-6)
     early_stopping = EarlyStopping(patience=patience, verbose=True)
 
     scaler = torch.amp.GradScaler('cuda')
@@ -756,7 +719,7 @@ def main():
     val_losses = []
 
     for epoch in range(num_epochs):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, scaler)
+        train_loss = train_one_epoch(model, train_loader, video_loader, optimizer, criterion, device, epoch, scaler, unsup_weight)
         train_losses.append(train_loss)
         val_loss = validate_one_epoch(model, val_loader, criterion, device, epoch, metrics_val)
         val_losses.append(val_loss)
@@ -798,4 +761,4 @@ def main():
     plt.show()
 
 if __name__ == "__main__":
-    main()
+    main() 

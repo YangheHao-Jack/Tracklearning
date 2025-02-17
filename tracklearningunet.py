@@ -36,7 +36,7 @@ def set_seed(seed=42):
 set_seed(42)
 
 # ------------------------------
-# 1. Loss Functions: Dice, Shape-Sensitive, and Combined Loss
+# 1. Loss Function: Dice Loss Only
 # ------------------------------
 
 class DiceLoss(nn.Module):
@@ -46,6 +46,7 @@ class DiceLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, logits, true):
+        # logits: (B, num_classes, H, W); true: (B, H, W)
         probs = F.softmax(logits, dim=1)
         true_one_hot = F.one_hot(true, num_classes=probs.shape[1]).permute(0, 3, 1, 2).float()
         dims = (0, 2, 3)
@@ -54,159 +55,13 @@ class DiceLoss(nn.Module):
         dice = (2. * intersection + self.smooth) / (cardinality + self.smooth)
         return 1 - dice.mean()
 
-def compute_SDM(mask_np):
-    dt_out = distance_transform_edt(1 - mask_np)
-    dt_in = distance_transform_edt(mask_np)
-    return dt_out - dt_in
-
-def compute_SDM_batch(mask_tensor):
-    mask_np = mask_tensor.cpu().numpy()
-    sdm_list = [compute_SDM(mask_np[i, 0]) for i in range(mask_np.shape[0])]
-    sdm_np = np.stack(sdm_list, axis=0)
-    sdm_tensor = torch.tensor(sdm_np, dtype=torch.float32, device=mask_tensor.device).unsqueeze(1)
-    return sdm_tensor
-
-class ViTFeatureExtractor(nn.Module):
-    """
-    Uses a pretrained ViT (vit_base_patch16_384) to extract features.
-    """
-    def __init__(self):
-        super(ViTFeatureExtractor, self).__init__()
-        import timm  # Import timm locally if needed
-        self.vit = timm.create_model('vit_base_patch16_384', pretrained=True)
-        self.vit.reset_classifier(0)
-    def forward(self, x):
-        if x.shape[1] == 1:
-            x = x.repeat(1, 3, 1, 1)
-        return self.vit(x)
-
-class ShapeSensitiveLoss(nn.Module):
-    """
-    Computes shape-sensitive loss as 1 - cosine similarity between features
-    extracted from the SDMs of the predicted and ground-truth masks.
-    """
-    def __init__(self, smooth=1e-6):
-        super(ShapeSensitiveLoss, self).__init__()
-        self.smooth = smooth
-        self.vit_extractor = ViTFeatureExtractor().to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-        for param in self.vit_extractor.parameters():
-            param.requires_grad = False
-
-    def forward(self, pred_logits, true):
-        pred_probs = F.softmax(pred_logits, dim=1)[:, 1:2, :, :]  # (B,1,H,W)
-        pred_mask = (pred_probs > 0.5).float()
-        true_mask = true.unsqueeze(1).float()  # (B,1,H,W)
-        pred_SDM = compute_SDM_batch(pred_mask)
-        true_SDM = compute_SDM_batch(true_mask)
-        # Resize SDMs to the ViT expected input resolution (384x384)
-        pred_SDM_resized = F.interpolate(pred_SDM, size=(384, 384), mode='bilinear', align_corners=False)
-        true_SDM_resized = F.interpolate(true_SDM, size=(384, 384), mode='bilinear', align_corners=False)
-        features_pred = self.vit_extractor(pred_SDM_resized)
-        features_true = self.vit_extractor(true_SDM_resized)
-        cos_sim = F.cosine_similarity(features_pred, features_true, dim=1)
-        return 1 - cos_sim.mean()
-
-class CombinedLoss(nn.Module):
-    """
-    Total loss is a combination of Dice Loss and Shape-Sensitive Loss.
-    """
-    def __init__(self, dice_weight=0.5, shape_weight=0.5, smooth=1e-6):
-        super(CombinedLoss, self).__init__()
-        self.dice_loss = DiceLoss(smooth)
-        self.shape_loss = ShapeSensitiveLoss(smooth)
-        self.dice_weight = dice_weight
-        self.shape_weight = shape_weight
-
-    def forward(self, logits, true):
-        loss_dice = self.dice_loss(logits, true)
-        loss_shape = self.shape_loss(logits, true)
-        return self.dice_weight * loss_dice + self.shape_weight * loss_shape
-
 # ------------------------------
 # 2. Dataset and Transforms (for images and masks)
 # ------------------------------
 
-class EnhanceContrastIntensityBlur(A.ImageOnlyTransform):
-    def __init__(self, clipLimit=2.0, tileGridSize=(8, 8), blur_kernel=(5, 5),
-                 intensity_filter_fn=None, always_apply=False, p=1.0):
-        """
-        Enhances contrast using CLAHE, optionally applies an intensity filter, and then blurs the image.
-        Returns a dictionary with:
-            - 'enhanced': the image after CLAHE.
-            - 'intensity_filtered': the image after intensity filtering.
-            - 'blurred': the final blurred image.
-        In the pipeline, we update the "image" key to the blurred image.
-        
-        Args:
-            clipLimit (float): CLAHE clip limit.
-            tileGridSize (tuple): CLAHE grid size.
-            blur_kernel (tuple): Kernel size for Gaussian blur.
-            intensity_filter_fn (callable, optional): Function that accepts an image (numpy array)
-                and returns a processed image. If None, intensity filtering is skipped.
-            always_apply (bool): Whether to always apply the transform.
-            p (float): Probability of applying the transform.
-        """
-        super(EnhanceContrastIntensityBlur, self).__init__(always_apply, p)
-        self.clipLimit = clipLimit
-        self.tileGridSize = tileGridSize
-        self.blur_kernel = blur_kernel
-        self.intensity_filter_fn = intensity_filter_fn
-
-    def __call__(self, image, **kwargs):
-        # Ensure the image is in uint8 format (required by OpenCV CLAHE)
-        image = np.array(image, dtype=np.uint8)
-        
-        # Step 1: Contrast enhancement using CLAHE.
-        clahe = cv2.createCLAHE(clipLimit=self.clipLimit, tileGridSize=self.tileGridSize)
-        enhanced = clahe.apply(image)
-        
-        # Step 2: Optional intensity filtering.
-        if self.intensity_filter_fn is not None:
-            intensity_filtered = self.intensity_filter_fn(enhanced)
-        else:
-            intensity_filtered = enhanced.copy()
-        
-        # Step 3: Apply Gaussian blur.
-        blurred = cv2.GaussianBlur(intensity_filtered, self.blur_kernel, 0)
-        
-        # Build the output dictionary.
-        results = {
-            'image': blurred,  # This will update the "image" key.
-            'enhanced': enhanced,
-            'intensity_filtered': intensity_filtered,
-            'blurred': blurred
-        }
-        # If a mask was passed, pass it along unchanged.
-        if "mask" in kwargs:
-            results["mask"] = kwargs["mask"]
-            
-        return results
-
-    def get_transform_init_args_names(self):
-        return ("clipLimit", "tileGridSize", "blur_kernel", "intensity_filter_fn")
-
-# --- Optional Intensity Filter Function ---
-
-def intensity_clip_filter(image, min_value=50, max_value=200):
-    """
-    Clips intensity values of the image between min_value and max_value.
-    
-    Args:
-        image (np.ndarray): Input image.
-        min_value (int): Minimum intensity.
-        max_value (int): Maximum intensity.
-    
-    Returns:
-        np.ndarray: The intensity-clipped image.
-    """
-    return np.clip(image, min_value, max_value)
-
-# --- Augmentation Pipeline Definition ---
-
 def get_augmentation_pipeline(size=(512, 512), augment=True):
     if augment:
         return A.Compose([
-            # Keep your previous transforms.
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
             A.RandomRotate90(p=0.5),
@@ -216,19 +71,7 @@ def get_augmentation_pipeline(size=(512, 512), augment=True):
             A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
             A.GaussNoise(p=0.3),
             A.Blur(blur_limit=3, p=0.2),
-            A.CoarseDropout(max_holes=1,
-                            max_height=int(size[1]*0.1),
-                            max_width=int(size[0]*0.1),
-                            p=0.2),
-            # Insert the custom transform.
-            EnhanceContrastIntensityBlur(
-                clipLimit=2.0,
-                tileGridSize=(8,8),
-                blur_kernel=(5,5),
-                intensity_filter_fn=lambda img: intensity_clip_filter(img, 50, 200),
-                p=1.0  # Always apply (adjust as needed)
-            ),
-            # Continue with downstream transforms.
+            A.CoarseDropout(max_holes=1, max_height=int(size[1] * 0.1), max_width=int(size[0] * 0.1), p=0.2),
             A.Resize(width=size[0], height=size[1]),
             A.Normalize(mean=(0.485,), std=(0.229,)),
             ToTensorV2()
@@ -240,22 +83,15 @@ def get_augmentation_pipeline(size=(512, 512), augment=True):
             ToTensorV2()
         ])
 
-# --- Dataset Transform Class ---
-
 class ResizeAndToTensorAlbumentations:
     def __init__(self, size=(512, 512), augment=False):
-        self.size = size
         self.transform = get_augmentation_pipeline(size=size, augment=augment)
-
     def __call__(self, image, mask):
         image_np = np.array(image)
         mask_np = np.array(mask)
-        # Ensure binary mask: map all values >1 to 1.
         mask_np = np.where(mask_np > 1, 1, mask_np).astype(np.uint8)
-        # Apply the augmentation. The custom transform will pass the mask along.
         augmented = self.transform(image=image_np, mask=mask_np)
         return augmented['image'], augmented['mask'].long()
-
 
 class BinarySegDatasetAlbumentations(Dataset):
     def __init__(self, images_dir, masks_dir, file_list, transform=None):
@@ -295,194 +131,139 @@ class BinarySegDatasetAlbumentations(Dataset):
         return image, mask
 
 # ------------------------------
-# 3. Advanced Model Definition: TransUNet with Flexible ResNet Encoder
+# 3. Advanced Model Definition: nnU-Net (Simplified Version)
 # ------------------------------
 
-class PositionalEncoding2D(nn.Module):
-    def __init__(self, embed_dim, height, width):
-        super(PositionalEncoding2D, self).__init__()
-        assert embed_dim % 2 == 0, "Embed dimension must be even"
-        # Initialize row and column embeddings with shape:
-        # row_embed: (1, embed_dim//2, height)
-        # col_embed: (1, embed_dim//2, width)
-        self.row_embed = nn.Parameter(torch.randn(1, embed_dim // 2, height))
-        self.col_embed = nn.Parameter(torch.randn(1, embed_dim // 2, width))
-
-    def forward(self, x):
-        # x is expected to have shape (B, embed_dim, H, W)
-        B, C, H, W = x.shape
-        # Expand col_embed to shape (1, embed_dim//2, H, W)
-        col_embed = self.col_embed.unsqueeze(2).expand(-1, -1, H, -1)
-        # Expand row_embed to shape (1, embed_dim//2, H, W)
-        row_embed = self.row_embed.unsqueeze(3).expand(-1, -1, -1, W)
-        # Concatenate along the channel dimension to get (1, embed_dim, H, W)
-        pos = torch.cat([col_embed, row_embed], dim=1)
-        # Repeat for each batch
-        return pos.repeat(B, 1, 1, 1)
-
-
-class TransformerEncoder(nn.Module):
-    def __init__(self, embed_dim, num_layers=4, num_heads=8, ff_dim=2048, dropout=0.1):
-        super(TransformerEncoder, self).__init__()
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=ff_dim, dropout=dropout)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-    def forward(self, x):
-        # x: (S, B, embed_dim)
-        return self.transformer(x)
-
-class DoubleConv(nn.Module):
+class ConvBlock(nn.Module):
+    """
+    A basic convolutional block: Conv -> BatchNorm -> ReLU -> Conv -> BatchNorm -> ReLU.
+    """
     def __init__(self, in_channels, out_channels):
-        super(DoubleConv, self).__init__()
+        super(ConvBlock, self).__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, padding=1),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=True)
         )
     def forward(self, x):
         return self.conv(x)
 
-class TransUNet(nn.Module):
-    def __init__(self, num_classes=2, img_size=512, encoder_name='resnet34', pretrained=True):
-        super(TransUNet, self).__init__()
-        self.img_size = img_size
-
-        # Define channel mappings for supported ResNet backbones.
-        # Each entry is a tuple: (skip0, skip1, skip2, skip3, deepest)
-        # skip0: output of conv1 (always 64 for torchvision ResNets)
-        # skip1: output of layer1, skip2: layer2, skip3: layer3, deepest: layer4
-        channel_dict = {
-            'resnet18':  (64, 64, 128, 256, 512),
-            'resnet34':  (64, 64, 128, 256, 512),
-            'resnet50':  (64, 256, 512, 1024, 2048),
-            'resnet101': (64, 256, 512, 1024, 2048)
-        }
-        if encoder_name not in channel_dict:
-            raise ValueError("Unsupported encoder. Choose from 'resnet18', 'resnet34', 'resnet50', or 'resnet101'.")
-        self.skip0, self.skip1, self.skip2, self.skip3, self.deepest = channel_dict[encoder_name]
-
-        # Encoder: load the selected ResNet backbone.
-        encoder_fn = getattr(models, encoder_name)
-        self.encoder = encoder_fn(pretrained=pretrained)
-        # Modify first conv layer to accept single-channel input.
-        self.encoder.conv1 = nn.Conv2d(1, self.encoder.conv1.out_channels,
-                                       kernel_size=self.encoder.conv1.kernel_size,
-                                       stride=self.encoder.conv1.stride,
-                                       padding=self.encoder.conv1.padding,
-                                       bias=False)
-        if pretrained:
-            with torch.no_grad():
-                # Average the weights over the RGB channels.
-                self.encoder.conv1.weight = nn.Parameter(
-                    self.encoder.conv1.weight.mean(dim=1, keepdim=True)
-                )
-        # Use layers up to layer4.
-        self.encoder_layers = nn.Sequential(
-            self.encoder.conv1,     # output: skip0 channels (64)
-            self.encoder.bn1,
-            self.encoder.relu,
-            self.encoder.maxpool,   # still 64 channels
-            self.encoder.layer1,    # output: skip1 channels (64 or 256)
-            self.encoder.layer2,    # output: skip2 channels (128 or 512)
-            self.encoder.layer3,    # output: skip3 channels (256 or 1024)
-            self.encoder.layer4     # output: deepest channels (512 or 2048)
+class LightweightUNet(nn.Module):
+    """
+    A lightweight U-Net architecture for 2D segmentation.
+    Uses fewer channels to reduce computational cost.
+    
+    Args:
+        in_channels (int): Number of input channels (e.g., 1 for grayscale).
+        out_channels (int): Number of output classes.
+        base_channels (int): Number of feature channels at the first level (default=16).
+    """
+    def __init__(self, in_channels=1, out_channels=2, base_channels=16):
+        super(LightweightUNet, self).__init__()
+        # Encoder
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.pool1 = nn.MaxPool2d(2)
+        
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels * 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels * 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels * 2, base_channels * 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels * 2),
+            nn.ReLU(inplace=True)
+        )
+        self.pool2 = nn.MaxPool2d(2)
+        
+        self.enc3 = nn.Sequential(
+            nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels * 4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels * 4, base_channels * 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels * 4),
+            nn.ReLU(inplace=True)
+        )
+        self.pool3 = nn.MaxPool2d(2)
+        
+        # Bottleneck
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(base_channels * 4, base_channels * 8, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels * 8),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels * 8, base_channels * 8, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels * 8),
+            nn.ReLU(inplace=True)
         )
         
-        # Transformer branch.
-        # Flatten conv: from deepest channels to transformer embedding dimension.
-        self.transformer_embed_dim = 768  # fixed embedding dimension
-        self.feat_h = img_size // 32
-        self.feat_w = img_size // 32
-        self.flatten_conv = nn.Conv2d(self.deepest, self.transformer_embed_dim, kernel_size=1)
+        # Decoder
+        self.up3 = nn.ConvTranspose2d(base_channels * 8, base_channels * 4, kernel_size=2, stride=2)
+        self.dec3 = nn.Sequential(
+            nn.Conv2d(base_channels * 8, base_channels * 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels * 4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels * 4, base_channels * 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels * 4),
+            nn.ReLU(inplace=True)
+        )
         
-        # Positional encoding and transformer encoder.
-        self.pos_encoding = PositionalEncoding2D(self.transformer_embed_dim, self.feat_h, self.feat_w)
-        self.transformer_encoder = TransformerEncoder(embed_dim=self.transformer_embed_dim, 
-                                                      num_layers=24, num_heads=24, ff_dim=3096)
+        self.up2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2, kernel_size=2, stride=2)
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(base_channels * 4, base_channels * 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels * 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels * 2, base_channels * 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels * 2),
+            nn.ReLU(inplace=True)
+        )
         
-        # Decoder: We design the decoder differently for smaller vs. larger backbones.
-        # For resnet18/34:
-        #   skip1:  skip from layer1 = 64, skip2 = 128, skip3 = 256.
-        # For resnet50/101:
-        #   skip1:  skip from layer1 = 256, skip2 = 512, skip3 = 1024.
-        if encoder_name in ['resnet50', 'resnet101']:
-            up4_out = 1024
-            conv4_out = 512
-            up3_out = 512
-            conv3_out = 256
-            up2_out = 256
-            conv2_out = 128
-            up1_out = 128
-            conv1_out = 64
-        else:
-            up4_out = 256
-            conv4_out = 256
-            up3_out = 128
-            conv3_out = 128
-            up2_out = 64
-            conv2_out = 64
-            up1_out = 64
-            conv1_out = 64
-
-        self.up4 = nn.ConvTranspose2d(self.transformer_embed_dim, up4_out, kernel_size=2, stride=2)
-        # For the first decoder block, we concatenate with skip from layer3.
-        self.conv4 = DoubleConv(up4_out + self.skip3, conv4_out)
-        self.up3 = nn.ConvTranspose2d(conv4_out, up3_out, kernel_size=2, stride=2)
-        self.conv3 = DoubleConv(up3_out + self.skip2, conv3_out)
-        self.up2 = nn.ConvTranspose2d(conv3_out, up2_out, kernel_size=2, stride=2)
-        self.conv2 = DoubleConv(up2_out + self.skip1, conv2_out)
-        self.up1 = nn.ConvTranspose2d(conv2_out, up1_out, kernel_size=2, stride=2)
-        # Here, we also concatenate the early features (skip0).
-        self.conv1 = DoubleConv(up1_out + self.skip0, conv1_out)
-        self.out_conv = nn.Conv2d(conv1_out, num_classes, kernel_size=1)
-
+        self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=2, stride=2)
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(base_channels * 2, base_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.out_conv = nn.Conv2d(base_channels, out_channels, kernel_size=1)
+    
     def forward(self, x):
-        # Encoder forward pass.
-        # We manually store skip features at the appropriate points.
-        # x0: after conv1 (skip0)
-        x0 = self.encoder.conv1(x)
-        x0 = self.encoder.bn1(x0)
-        x0 = self.encoder.relu(x0)
-        # After maxpool (still skip0 shape) but we don't use this.
-        x = self.encoder.maxpool(x0)
-        # x1: output of layer1 (skip1)
-        x1 = self.encoder.layer1(x)
-        # x2: output of layer2 (skip2)
-        x2 = self.encoder.layer2(x1)
-        # x3: output of layer3 (skip3)
-        x3 = self.encoder.layer3(x2)
-        # x4: output of layer4 (deepest)
-        x4 = self.encoder.layer4(x3)
-
-        # Transformer branch.
-        feat = self.flatten_conv(x4)           # (B, transformer_embed_dim, H/32, W/32)
-        pos = self.pos_encoding(feat)           # Same shape as feat.
-        feat = feat + pos
-        B, C, H, W = feat.shape
-        feat_flat = feat.view(B, C, -1).permute(2, 0, 1)  # (S, B, C) where S = H*W
-        feat_trans = self.transformer_encoder(feat_flat)
-        feat_trans = feat_trans.permute(0, 2, 1).reshape(B, C, H, W) # Note: or permute(1,2,0) depending on transformer output.
-        # Decoder:
-        d4 = self.up4(feat_trans)              # (B, up4_out, H/16, W/16)
-        d4 = torch.cat([d4, x3], dim=1)          # x3 has self.skip3 channels.
-        d4 = self.conv4(d4)                    # (B, conv4_out, H/16, W/16)
-        d3 = self.up3(d4)                      # (B, up3_out, H/8, W/8)
-        d3 = torch.cat([d3, x2], dim=1)          # x2 has self.skip2 channels.
-        d3 = self.conv3(d3)                    # (B, conv3_out, H/8, W/8)
-        d2 = self.up2(d3)                      # (B, up2_out, H/4, W/4)
-        d2 = torch.cat([d2, x1], dim=1)          # x1 has self.skip1 channels.
-        d2 = self.conv2(d2)                    # (B, conv2_out, H/4, W/4)
-        d1 = self.up1(d2)                      # (B, up1_out, H/2, W/2)
-        d1 = torch.cat([d1, x0], dim=1)          # x0 has self.skip0 channels.
-        d1 = self.conv1(d1)                    # (B, conv1_out, H/2, W/2)
-        out = self.out_conv(d1)                # (B, num_classes, H/2, W/2)
-        out = F.interpolate(out, scale_factor=2, mode='bilinear', align_corners=True)  # (B, num_classes, H, W)
-        return out
+        # Encoder path
+        x1 = self.enc1(x)               # (B, base_channels, H, W)
+        x2 = self.enc2(self.pool1(x1))    # (B, base_channels*2, H/2, W/2)
+        x3 = self.enc3(self.pool2(x2))    # (B, base_channels*4, H/4, W/4)
+        
+        # Bottleneck
+        b = self.bottleneck(self.pool3(x3))  # (B, base_channels*8, H/8, W/8)
+        
+        # Decoder path with skip connections
+        d3 = self.up3(b)                    # (B, base_channels*4, H/4, W/4)
+        d3 = torch.cat([d3, x3], dim=1)       # (B, base_channels*8, H/4, W/4)
+        d3 = self.dec3(d3)                  # (B, base_channels*4, H/4, W/4)
+        
+        d2 = self.up2(d3)                   # (B, base_channels*2, H/2, W/2)
+        d2 = torch.cat([d2, x2], dim=1)       # (B, base_channels*4, H/2, W/2)
+        d2 = self.dec2(d2)                  # (B, base_channels*2, H/2, W/2)
+        
+        d1 = self.up1(d2)                   # (B, base_channels, H, W)
+        d1 = torch.cat([d1, x1], dim=1)       # (B, base_channels*2, H, W)
+        d1 = self.dec1(d1)                  # (B, base_channels, H, W)
+        
+        return self.out_conv(d1)
 
 # ------------------------------
-# 5. EarlyStopping Class
+# 4. EarlyStopping, Training, Validation, Testing, and Visualization Functions
+# (These remain largely unchanged from your previous code.)
 # ------------------------------
 
 class EarlyStopping:
@@ -511,10 +292,6 @@ class EarlyStopping:
             self.counter = 0
             if self.verbose:
                 print(f"[EarlyStopping] Validation loss improved to: {self.best_loss:.4f}")
-
-# ------------------------------
-# 6. Training, Validation, and Testing Functions (without Domain Adaptation)
-# ------------------------------
 
 def train_one_epoch(model, loader, optimizer, criterion, device, epoch_idx, scaler):
     model.train()
@@ -593,7 +370,7 @@ def dice_coefficient(pred, target, smooth=1e-6):
     return (2. * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth)
 
 # ------------------------------
-# 7. Visualization and Post-Processing
+# 7. Visualization and Post-Processing Functions
 # ------------------------------
 
 def thin_mask(mask, kernel_size=3, iterations=1):
@@ -659,7 +436,7 @@ def visualize_predictions(model, dataset, device, num_samples=3, post_process_fl
         plt.show()
 
 # ------------------------------
-# 8. Main Function: Setup, Training, and Testing (Without Domain Adaptation)
+# 8. Main Function: Setup, Training, and Testing (Using nnU-Net for Segmentation)
 # ------------------------------
 
 def main():
@@ -670,9 +447,9 @@ def main():
     test_masks_dir = "/home/yanghehao/tracklearning/segmentation/phantom_test/masks"
 
     batch_size = 16
-    num_epochs = 100
+    num_epochs = 150
     learning_rate = 1e-4
-    save_path = "best_transunet_modelImproveARG2.pth"
+    save_path = "best_nnunet_model3.pth"
     patience = 10
     post_process_flag = False
     apply_erosion = True
@@ -720,13 +497,12 @@ def main():
     val_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    print("[Main] Starting training with advanced model: TransUNet (Without Domain Adaptation)")
+    print("[Main] Starting training with advanced model: nnU-Net (Simplified Version for Catheter Segmentation)")
 
-    # Initialize the TransUNet model with flexible ResNet encoder.
-    # Change encoder_name to 'resnet18', 'resnet34', 'resnet50', etc. as desired.
-    model = TransUNet(num_classes=2, img_size=512, encoder_name='resnet50', pretrained=True).to(device)
-    # Use the combined loss (Dice + Shape-Sensitive).
-    criterion = CombinedLoss(dice_weight=0.5, shape_weight=0.5, smooth=1e-6)
+    # Initialize the nnU-Net model.
+    model = LightweightUNet(in_channels=1, out_channels=2, base_channels=8).to(device)
+    # Use Dice loss only.
+    criterion = DiceLoss(smooth=1e-6)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-6)
     early_stopping = EarlyStopping(patience=patience, verbose=True)

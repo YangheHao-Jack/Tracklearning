@@ -266,18 +266,36 @@ class ResizeAndToTensorAlbumentationsImageOnly:
 
 class PositionalEncoding2D(nn.Module):
     def __init__(self, embed_dim, height, width):
+        """
+        Args:
+            embed_dim (int): Must be even.
+            height (int): Expected height of the feature map (e.g. img_size // 32).
+            width (int): Expected width of the feature map (e.g. img_size // 32).
+        """
         super(PositionalEncoding2D, self).__init__()
-        self.row_embed = nn.Parameter(torch.randn(1, embed_dim // 2, height))
-        self.col_embed = nn.Parameter(torch.randn(1, embed_dim // 2, width))
+        assert embed_dim % 2 == 0, "embed_dim must be even"
+        # Create row and column embeddings as 4D parameters
+        # row_embed: shape (1, embed_dim//2, height, 1)
+        # col_embed: shape (1, embed_dim//2, 1, width)
+        self.row_embed = nn.Parameter(torch.randn(1, embed_dim // 2, height, 1))
+        self.col_embed = nn.Parameter(torch.randn(1, embed_dim // 2, 1, width))
 
     def forward(self, x):
-        # x shape: (B, embed_dim, H, W)
+        """
+        Args:
+            x (torch.Tensor): Input feature map of shape (B, embed_dim, H, W).
+        Returns:
+            pos (torch.Tensor): Positional encoding of shape (B, embed_dim, H, W).
+        """
         B, C, H, W = x.shape
-        pos = torch.cat([
-            self.col_embed.repeat(1, 1, H),
-            self.row_embed.repeat(1, 1, W)
-        ], dim=1)
-        pos = pos.unsqueeze(0).repeat(B, 1, 1, 1)
+        # Interpolate embeddings to match the current spatial size if needed.
+        row = F.interpolate(self.row_embed, size=(H, 1), mode='bilinear', align_corners=False)
+        col = F.interpolate(self.col_embed, size=(1, W), mode='bilinear', align_corners=False)
+        # Expand along the missing spatial dimension
+        row = row.expand(B, -1, H, W)
+        col = col.expand(B, -1, H, W)
+        # Concatenate along the channel dimension
+        pos = torch.cat([row, col], dim=1)  # shape: (B, embed_dim, H, W)
         return pos
 
 class TransformerEncoder(nn.Module):
@@ -329,7 +347,7 @@ class TransUNet(nn.Module):
 
         self.flatten_conv = nn.Conv2d(512, self.transformer_embed_dim, kernel_size=1)
         self.pos_encoding = PositionalEncoding2D(self.transformer_embed_dim, self.feat_h, self.feat_w)
-        self.transformer_encoder = TransformerEncoder(embed_dim=self.transformer_embed_dim, num_layers=4, num_heads=8, ff_dim=2048)
+        self.transformer_encoder = TransformerEncoder(embed_dim=self.transformer_embed_dim, num_layers=16, num_heads=16, ff_dim=3096)
 
         # Decoder: U-Net style upsampling with skip connections.
         # Use skip connections from encoder.layer3, encoder.layer2, and encoder.layer1.
@@ -391,17 +409,14 @@ class TransUNet(nn.Module):
 
         # Decoder with skip connections.
         d4 = self.up4(feat_trans)      # (B,256,H/16,W/16)
-        # Skip connection from x5: (B,256,H/16,W/16)
         d4 = torch.cat([d4, x5], dim=1)
         d4 = self.conv4(d4)
 
         d3 = self.up3(d4)              # (B,128,H/8,W/8)
-        # Skip connection from x4: (B,128,H/8,W/8)
         d3 = torch.cat([d3, x4], dim=1)
         d3 = self.conv3(d3)
 
         d2 = self.up2(d3)              # (B,64,H/4,W/4)
-        # Skip connection from x3: (B,64,H/4,W/4)
         d2 = torch.cat([d2, x3], dim=1)
         d2 = self.conv2(d2)
 
@@ -455,7 +470,7 @@ def train_one_epoch(model, loader, video_loader, optimizer, criterion, device, e
         images = images.to(device)
         masks = masks.to(device)
         optimizer.zero_grad()
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             outputs = model(images)
             loss_sup = criterion(outputs, masks)
             # Unsupervised entropy loss on video frames.
@@ -596,21 +611,52 @@ def visualize_predictions(model, dataset, device, num_samples=3, post_process_fl
         plt.show()
 
 # ------------------------------
-# 8. Main Function: Setup, Training, and Testing
+# 8. Checkpoint Saving/Loading Functions
+# ------------------------------
+
+def save_checkpoint(state, filename="checkpoint.pth"):
+    """
+    Saves a checkpoint dictionary to a file.
+    """
+    torch.save(state, filename)
+    print(f"Checkpoint saved to {filename}")
+
+def load_checkpoint(filename, model, optimizer=None, scheduler=None):
+    """
+    Loads a checkpoint dictionary from a file and restores model (and optimizer/scheduler if provided).
+    """
+    if os.path.isfile(filename):
+        checkpoint = torch.load(filename, map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        model.load_state_dict(checkpoint["model_state_dict"])
+        if optimizer is not None and "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if scheduler is not None and "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        start_epoch = checkpoint.get("epoch", 0)
+        best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+        print(f"Loaded checkpoint '{filename}' (epoch {start_epoch})")
+        return start_epoch, best_val_loss
+    else:
+        print(f"No checkpoint found at '{filename}'. Starting from scratch.")
+        return 0, float("inf")
+
+# ------------------------------
+# 9. Main Function: Setup, Training, Testing, and Checkpointing
 # ------------------------------
 
 def main():
     # Update these paths accordingly.
-    images_dir = "/path/to/train/images/"
-    masks_dir = "/path/to/train/masks/"
-    test_images_dir = "/path/to/test/images/"
-    test_masks_dir = "/path/to/test/masks/"
-    video_path = "/path/to/video_for_domain_adaptation.mp4"  # Video for domain adaptation
+    images_dir = "/home/yanghehao/tracklearning/segmentation/phantom_train/images/"
+    masks_dir = "/home/yanghehao/tracklearning/segmentation/phantom_train/masks/"
+    test_images_dir = "/home/yanghehao/tracklearning/segmentation/phantom_test/images/"
+    test_masks_dir = "/home/yanghehao/tracklearning/segmentation/phantom_test/masks/"
+    video_path = "/home/yanghehao/tracklearning/DATA/Tom.mp4"  # Video for domain adaptation
 
     batch_size = 16
     num_epochs = 150
     learning_rate = 1e-4
-    save_path = "best_transunet_model.pth"
+    checkpoint_path = "checkpoint.pth"
+    best_model_path = "best_transunet_modelDS2.pth"
     patience = 10
     unsup_weight = 0.1  # Weight for unsupervised (entropy) loss on video frames
     post_process_flag = False
@@ -664,18 +710,18 @@ def main():
     video_dataset = VideoFrameDataset(video_path, transform=video_transform, every_n_frame=5)
     video_loader = DataLoader(video_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
-    print("[Main] Starting training with advanced model: TransUNet")
-
-    # Initialize the TransUNet model with flexible ResNet encoder.
-    # You can change 'encoder_name' to 'resnet18', 'resnet34', 'resnet50', etc.
+    print("[Main] Initializing the TransUNet model...")
     model = TransUNet(num_classes=2, img_size=512, encoder_name='resnet34', pretrained=True).to(device)
     # Use the combined loss (Dice + Shape-Sensitive).
     criterion = CombinedLoss(dice_weight=0.5, shape_weight=0.5, smooth=1e-6)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-6)
+    scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-6)
     early_stopping = EarlyStopping(patience=patience, verbose=True)
 
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
+
+    # Optionally resume from checkpoint if it exists.
+    start_epoch, best_val_loss = load_checkpoint(checkpoint_path, model, optimizer, scheduler)
 
     # Define evaluation metrics using torchmetrics.
     metrics_val = {
@@ -694,21 +740,31 @@ def main():
         'recall': torchmetrics.Recall(task='multiclass', num_classes=2, average='macro').to(device),
         'f1': torchmetrics.F1Score(task='multiclass', num_classes=2, average='macro').to(device)
     }
-
     best_val_loss = float('inf')
     train_losses = []
     val_losses = []
-
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         train_loss = train_one_epoch(model, train_loader, video_loader, optimizer, criterion, device, epoch, scaler, unsup_weight)
         train_losses.append(train_loss)
         val_loss = validate_one_epoch(model, val_loader, criterion, device, epoch, metrics_val)
         val_losses.append(val_loss)
         scheduler.step()
         print(f"Epoch [{epoch+1}/{num_epochs}] | LR: {optimizer.param_groups[0]['lr']:.6f} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+        
+        # Save checkpoint after every epoch.
+        checkpoint = {
+            "epoch": epoch + 1,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "best_val_loss": best_val_loss
+        }
+        save_checkpoint(checkpoint, filename=checkpoint_path)
+
+        # Save best model separately.
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), save_path)
+            torch.save(model.state_dict(), best_model_path)
             print(f">> Saved best model with Val Loss: {best_val_loss:.4f}")
             early_stopping.counter = 0
         else:
@@ -718,10 +774,10 @@ def main():
                 break
 
     print(f"\n[Main] Training complete. Best Validation Loss: {best_val_loss:.4f}")
-    print(f"[Main] Best model saved at: {save_path}")
+    print(f"[Main] Best model saved at: {best_model_path}")
 
     print("\n>>> Loading best model for testing...")
-    model.load_state_dict(torch.load(save_path))
+    model.load_state_dict(torch.load(best_model_path))
     model.eval()
     test_metrics_results = test_segmentation(model, test_loader, device, metrics=metrics_test)
     print(f"Test Metrics: {test_metrics_results}")
@@ -733,8 +789,8 @@ def main():
         print("[Warning] No test samples available for visualization.")
 
     plt.figure(figsize=(10, 5))
-    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
-    plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
+    plt.plot(range(1, num_epochs + 1), train_losses, label='Training Loss')
+    plt.plot(range(1, num_epochs + 1), val_losses, label='Validation Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.title('Training and Validation Loss Curves')

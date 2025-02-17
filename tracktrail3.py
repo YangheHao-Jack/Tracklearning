@@ -445,9 +445,9 @@ def process_video(model, cap, out, device='cpu', target_size=(512, 512), rotate_
 # ------------------------------
 
 def main():
-    model_path = "best_segvit_model10.pth"
-    input_video_path = "/home/yanghehao/tracklearning/DATA/input_large2.mp4"
-    output_video_path = "/home/yanghehao/tracklearning/DATA/input_large2Out.mp4"
+    model_path = "best_segvit_model9.pth"
+    input_video_path = "/home/yanghehao/tracklearning/DATA/Tom.mp4"
+    output_video_path = "/home/yanghehao/tracklearning/DATA/Out.mp4"
     target_size = (480, 320)  # (width, height)
     rotate_clockwise90 = True
     fps = 60.0

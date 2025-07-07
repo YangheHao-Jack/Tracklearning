@@ -403,15 +403,15 @@ def visualize_predictions(model, dataset, device, num_samples=3, post_process_fl
 
 def main():
     # Update these paths accordingly.
-    images_dir = "/home/yanghehao/tracklearning/segmentation/phantom_train/images/"
-    masks_dir = "/home/yanghehao/tracklearning/segmentation/phantom_train/masks/"
-    test_images_dir = "/home/yanghehao/tracklearning/segmentation/phantom_test/images"
-    test_masks_dir = "/home/yanghehao/tracklearning/segmentation/phantom_test/masks"
+    images_dir = "/home/jack/segmentation/combined_train/images"
+    masks_dir = "/home/jack/segmentation/combined_train/masks"
+    test_images_dir = "/home/jack/segmentation/combined_test/images"
+    test_masks_dir = "/home/jack/segmentation/combined_test/masks"
 
     batch_size = 16
     num_epochs = 150
     learning_rate = 1e-4
-    save_path = "best_nnunet_model2.pth"
+    save_path = "best_nnunet_model_animal.pth"
     patience = 10
     post_process_flag = False
     apply_erosion = True
